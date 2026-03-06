@@ -1,0 +1,33 @@
+name "lowlayergui"
+description "Low-layer GUI implementation in D."
+authors "Hiroki Noda"
+copyright "Copyright © 2026, Hiroki Noda"
+license "BSL-1.0"
+targetType "executable"
+
+dependency "erupted"        version="~>2.1"
+dependency "wayland:client" version="~>0.4"
+
+versions "WlDynamic"
+
+libs "vulkan" "harfbuzz" "xkbcommon" "icuuc" "icui18n" "freetype"
+
+lflags "-rpath=/usr/lib/x86_64-linux-gnu"
+
+preGenerateCommands \
+    "mkdir -p gen" \
+    "dub run wayland:scanner -- -c client -m xdg_shell -i /usr/share/wayland-protocols/stable/xdg-shell/xdg-shell.xml -o gen/xdg_shell.d" \
+    "dub run wayland:scanner -- -c client -m text_input_unstable_v3 -i /usr/share/wayland-protocols/unstable/text-input/text-input-unstable-v3.xml -o gen/text_input_unstable_v3.d"
+
+sourcePaths "source" "gen"
+
+buildRequirements "allowWarnings"
+
+buildType "debug" {
+    buildOptions "debugMode" "debugInfo"
+    dflags "-check=all"
+}
+
+buildType "release" {
+    buildOptions "releaseMode" "optimize" "inline"
+}
