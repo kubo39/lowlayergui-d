@@ -8,7 +8,7 @@ targetType "executable"
 dependency "erupted"        version="~>2.1"
 dependency "wayland:client" version="~>0.4"
 
-versions "WlDynamic"
+subConfiguration "wayland:client" "dynamic"
 
 libs "vulkan" "harfbuzz" "xkbcommon" "icuuc" "icui18n" "freetype"
 
@@ -25,7 +25,6 @@ buildRequirements "allowWarnings"
 
 buildType "debug" {
     buildOptions "debugMode" "debugInfo"
-    dflags "-check=all"
 }
 
 buildType "release" {
