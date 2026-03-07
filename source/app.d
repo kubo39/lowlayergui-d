@@ -1,7 +1,7 @@
 import wayland.client;
 import wayland.native.util : wl_array;
 import xdg_shell;
-import vulkan_setup;
+import vulkan_setup : VulkanSetup, RectInstance;
 
 import std.algorithm : min;
 import std.exception : enforce;
@@ -73,6 +73,7 @@ class App
             {
                 // 初回 configure でサイズが確定してから Vulkan を初期化
                 vulkan = new VulkanSetup(display, surface, pendingW, pendingH);
+                setupDemoRects();
                 configured = true;
             }
             else if (vulkan)
@@ -84,6 +85,37 @@ class App
 
         toplevel.setTitle("lowlayergui");
         surface.commit();
+    }
+
+    // 32×32 = 1024個の矩形を格子状に配置
+    private void setupDemoRects()
+    {
+        enum cols  = 32, rows = 32;
+        enum float cellW = 2.0f / cols;
+        enum float cellH = 2.0f / rows;
+        enum float gap   = 0.003f;
+
+        RectInstance[] rs;
+        rs.reserve(cols * rows);
+        foreach (row; 0 .. rows)
+        {
+            foreach (col; 0 .. cols)
+            {
+                float x = -1.0f + col * cellW + gap;
+                float y = -1.0f + row * cellH + gap;
+                float w = cellW - gap * 2;
+                float h = cellH - gap * 2;
+
+                float r = cast(float) col / cols;
+                float g = cast(float) row / rows;
+                float b = 1.0f - (r + g) * 0.5f;
+
+                float cr = gap * 0.5f;  // 角丸半径 (NDC単位)
+
+                rs ~= RectInstance([x, y, w, h], [r, g, b, 1.0f], cr, [0f, 0f, 0f]);
+            }
+        }
+        vulkan.rects = rs;
     }
 
     void run()

@@ -17,6 +17,16 @@ import std.conv : to;
 
 // ---------------------------------------------------------------------------
 
+struct RectInstance {
+    float[4] rect;         // x, y, width, height (NDC)
+    float[4] color;        // RGBA
+    float    cornerRadius;
+    float[3] _pad;
+}
+static assert(RectInstance.sizeof == 48);
+
+// ---------------------------------------------------------------------------
+
 private void enforceVK(VkResult r, string msg = "Vulkan error")
 {
     if (r != VK_SUCCESS)
@@ -28,6 +38,7 @@ private void enforceVK(VkResult r, string msg = "Vulkan error")
 class VulkanSetup
 {
     enum MAX_FRAMES = 2;
+    enum MAX_RECTS  = 4096;
 
     // Vulkan handles
     VkInstance       instance;
@@ -60,6 +71,19 @@ class VulkanSetup
     VkFence    [MAX_FRAMES] inFlight;
     uint currentFrame;
 
+    // Rect pipeline (Phase 4)
+    VkDescriptorSetLayout          descSetLayout;
+    VkPipelineLayout               pipelineLayout;
+    VkPipeline                     rectPipeline;
+    VkBuffer      [MAX_FRAMES]     ssboBuffer;
+    VkDeviceMemory[MAX_FRAMES]     ssboMemory;
+    void*         [MAX_FRAMES]     ssboBufMapped;
+    VkDescriptorPool               descPool;
+    VkDescriptorSet[MAX_FRAMES]    descSets;
+
+    // Rect data — set from outside before renderFrame
+    RectInstance[] rects;
+
     uint width, height;
     bool needsResize;
 
@@ -79,6 +103,11 @@ class VulkanSetup
         createCommandPool();
         allocCommandBuffers();
         createSyncObjects();
+        // Phase 4
+        createDescSetLayout();
+        createSsboBuffers();
+        createDescriptors();
+        createRectPipeline();
     }
 
     // -------------------------------------------------------------------
@@ -392,6 +421,239 @@ class VulkanSetup
     }
 
     // -------------------------------------------------------------------
+    // Phase 4: rect instancing pipeline
+    // -------------------------------------------------------------------
+
+    private uint findMemoryType(uint typeFilter, VkMemoryPropertyFlags props)
+    {
+        VkPhysicalDeviceMemoryProperties memProps;
+        vkGetPhysicalDeviceMemoryProperties(physDevice, &memProps);
+        foreach (i; 0 .. memProps.memoryTypeCount)
+        {
+            if ((typeFilter & (1u << i)) &&
+                (memProps.memoryTypes[i].propertyFlags & props) == props)
+                return i;
+        }
+        throw new Exception("Failed to find suitable memory type");
+    }
+
+    private VkShaderModule createShaderModule(const(ubyte)[] code)
+    {
+        VkShaderModuleCreateInfo info = {
+            sType:    VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+            codeSize: code.length,
+            pCode:    cast(const uint*) code.ptr,
+        };
+        VkShaderModule mod;
+        vkCreateShaderModule(device, &info, null, &mod).enforceVK("vkCreateShaderModule");
+        return mod;
+    }
+
+    private void createDescSetLayout()
+    {
+        VkDescriptorSetLayoutBinding binding = {
+            binding:         0,
+            descriptorType:  VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            descriptorCount: 1,
+            stageFlags:      VK_SHADER_STAGE_VERTEX_BIT,
+        };
+        VkDescriptorSetLayoutCreateInfo info = {
+            sType:        VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+            bindingCount: 1,
+            pBindings:    &binding,
+        };
+        vkCreateDescriptorSetLayout(device, &info, null, &descSetLayout)
+            .enforceVK("vkCreateDescriptorSetLayout");
+    }
+
+    private void createSsboBuffers()
+    {
+        VkDeviceSize bufSize = RectInstance.sizeof * MAX_RECTS;
+        foreach (i; 0 .. MAX_FRAMES)
+        {
+            VkBufferCreateInfo bInfo = {
+                sType:       VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                size:        bufSize,
+                usage:       VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                sharingMode: VK_SHARING_MODE_EXCLUSIVE,
+            };
+            vkCreateBuffer(device, &bInfo, null, &ssboBuffer[i]).enforceVK("vkCreateBuffer");
+
+            VkMemoryRequirements memReqs;
+            vkGetBufferMemoryRequirements(device, ssboBuffer[i], &memReqs);
+
+            VkMemoryAllocateInfo aInfo = {
+                sType:           VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                allocationSize:  memReqs.size,
+                memoryTypeIndex: findMemoryType(memReqs.memoryTypeBits,
+                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                    VK_MEMORY_PROPERTY_HOST_COHERENT_BIT),
+            };
+            vkAllocateMemory(device, &aInfo, null, &ssboMemory[i]).enforceVK("vkAllocateMemory");
+            vkBindBufferMemory(device, ssboBuffer[i], ssboMemory[i], 0).enforceVK;
+            vkMapMemory(device, ssboMemory[i], 0, bufSize, 0, &ssboBufMapped[i]).enforceVK;
+        }
+    }
+
+    private void createDescriptors()
+    {
+        VkDescriptorPoolSize poolSize = {
+            type:            VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            descriptorCount: MAX_FRAMES,
+        };
+        VkDescriptorPoolCreateInfo poolInfo = {
+            sType:         VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+            maxSets:       MAX_FRAMES,
+            poolSizeCount: 1,
+            pPoolSizes:    &poolSize,
+        };
+        vkCreateDescriptorPool(device, &poolInfo, null, &descPool)
+            .enforceVK("vkCreateDescriptorPool");
+
+        VkDescriptorSetLayout[MAX_FRAMES] layouts;
+        layouts[] = descSetLayout;
+
+        VkDescriptorSetAllocateInfo allocInfo = {
+            sType:              VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            descriptorPool:     descPool,
+            descriptorSetCount: MAX_FRAMES,
+            pSetLayouts:        layouts.ptr,
+        };
+        vkAllocateDescriptorSets(device, &allocInfo, descSets.ptr)
+            .enforceVK("vkAllocateDescriptorSets");
+
+        VkDeviceSize bufSize = RectInstance.sizeof * MAX_RECTS;
+        foreach (i; 0 .. MAX_FRAMES)
+        {
+            VkDescriptorBufferInfo bufInfo = {
+                buffer: ssboBuffer[i],
+                offset: 0,
+                range:  bufSize,
+            };
+            VkWriteDescriptorSet write = {
+                sType:           VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                dstSet:          descSets[i],
+                dstBinding:      0,
+                descriptorType:  VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                descriptorCount: 1,
+                pBufferInfo:     &bufInfo,
+            };
+            vkUpdateDescriptorSets(device, 1, &write, 0, null);
+        }
+    }
+
+    private void createRectPipeline()
+    {
+        auto vertCode = cast(immutable(ubyte)[]) import("rect.vert.spv");
+        auto fragCode = cast(immutable(ubyte)[]) import("rect.frag.spv");
+
+        auto vertMod = createShaderModule(vertCode);
+        auto fragMod = createShaderModule(fragCode);
+        scope(exit)
+        {
+            vkDestroyShaderModule(device, vertMod, null);
+            vkDestroyShaderModule(device, fragMod, null);
+        }
+
+        VkPipelineShaderStageCreateInfo[2] stages = [
+            {
+                sType:   VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                stage:   VK_SHADER_STAGE_VERTEX_BIT,
+                module_: vertMod,
+                pName:   "main".ptr,
+            },
+            {
+                sType:   VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                stage:   VK_SHADER_STAGE_FRAGMENT_BIT,
+                module_: fragMod,
+                pName:   "main".ptr,
+            },
+        ];
+
+        // 頂点バッファなし (シェーダ内でクワッド生成)
+        VkPipelineVertexInputStateCreateInfo vertInput = {
+            sType: VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+        };
+
+        VkPipelineInputAssemblyStateCreateInfo inputAssembly = {
+            sType:    VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+            topology: VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+        };
+
+        // ビューポートとシザーは動的に設定 (リサイズ時にパイプライン再生成不要)
+        VkDynamicState[2] dynStates = [VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR];
+        VkPipelineDynamicStateCreateInfo dynState = {
+            sType:             VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+            dynamicStateCount: 2,
+            pDynamicStates:    dynStates.ptr,
+        };
+
+        VkPipelineViewportStateCreateInfo viewportState = {
+            sType:         VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+            viewportCount: 1,
+            scissorCount:  1,
+        };
+
+        VkPipelineRasterizationStateCreateInfo rasterizer = {
+            sType:       VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+            polygonMode: VK_POLYGON_MODE_FILL,
+            cullMode:    VK_CULL_MODE_NONE,
+            frontFace:   VK_FRONT_FACE_COUNTER_CLOCKWISE,
+            lineWidth:   1.0f,
+        };
+
+        VkPipelineMultisampleStateCreateInfo multisampling = {
+            sType:                VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+            rasterizationSamples: VK_SAMPLE_COUNT_1_BIT,
+        };
+
+        // アルファブレンディング有効
+        VkPipelineColorBlendAttachmentState blendAttach = {
+            colorWriteMask:      VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                                 VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT,
+            blendEnable:         VK_TRUE,
+            srcColorBlendFactor: VK_BLEND_FACTOR_SRC_ALPHA,
+            dstColorBlendFactor: VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+            colorBlendOp:        VK_BLEND_OP_ADD,
+            srcAlphaBlendFactor: VK_BLEND_FACTOR_ONE,
+            dstAlphaBlendFactor: VK_BLEND_FACTOR_ZERO,
+            alphaBlendOp:        VK_BLEND_OP_ADD,
+        };
+
+        VkPipelineColorBlendStateCreateInfo blending = {
+            sType:           VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+            attachmentCount: 1,
+            pAttachments:    &blendAttach,
+        };
+
+        VkPipelineLayoutCreateInfo layoutInfo = {
+            sType:          VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+            setLayoutCount: 1,
+            pSetLayouts:    &descSetLayout,
+        };
+        vkCreatePipelineLayout(device, &layoutInfo, null, &pipelineLayout)
+            .enforceVK("vkCreatePipelineLayout");
+
+        VkGraphicsPipelineCreateInfo pipelineInfo = {
+            sType:               VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+            stageCount:          2,
+            pStages:             stages.ptr,
+            pVertexInputState:   &vertInput,
+            pInputAssemblyState: &inputAssembly,
+            pViewportState:      &viewportState,
+            pRasterizationState: &rasterizer,
+            pMultisampleState:   &multisampling,
+            pColorBlendState:    &blending,
+            pDynamicState:       &dynState,
+            layout:              pipelineLayout,
+            renderPass:          renderPass,
+            subpass:             0,
+        };
+        vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, null, &rectPipeline)
+            .enforceVK("vkCreateGraphicsPipelines");
+    }
+
+    // -------------------------------------------------------------------
 
     void renderFrame()
     {
@@ -406,7 +668,15 @@ class VulkanSetup
 
         vkResetFences(device, 1, &inFlight[currentFrame]);
 
-        // コマンドバッファを毎フレーム記録 (クリアカラーのみ)
+        // SSBO に矩形データをアップロード
+        size_t rectCount = rects.length > MAX_RECTS ? MAX_RECTS : rects.length;
+        if (rectCount > 0)
+        {
+            import core.stdc.string : memcpy;
+            memcpy(ssboBufMapped[currentFrame], rects.ptr,
+                   RectInstance.sizeof * rectCount);
+        }
+
         auto cmd = cmdBuffers[imageIndex];
         VkCommandBufferBeginInfo beginInfo = {
             sType: VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -425,6 +695,28 @@ class VulkanSetup
             pClearValues:    &clearColor,
         };
         vkCmdBeginRenderPass(cmd, &rpInfo, VK_SUBPASS_CONTENTS_INLINE);
+
+        if (rectCount > 0)
+        {
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, rectPipeline);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                pipelineLayout, 0, 1, &descSets[currentFrame], 0, null);
+
+            VkViewport vp = {
+                x: 0.0f, y: 0.0f,
+                width:    cast(float) swapExtent.width,
+                height:   cast(float) swapExtent.height,
+                minDepth: 0.0f,
+                maxDepth: 1.0f,
+            };
+            VkRect2D sc = { offset: VkOffset2D(0, 0), extent: swapExtent };
+            vkCmdSetViewport(cmd, 0, 1, &vp);
+            vkCmdSetScissor (cmd, 0, 1, &sc);
+
+            // 頂点バッファなし: gl_VertexIndex で6頂点クワッド生成
+            vkCmdDraw(cmd, 6, cast(uint) rectCount, 0, 0);
+        }
+
         vkCmdEndRenderPass(cmd);
         vkEndCommandBuffer(cmd).enforceVK;
 
@@ -478,7 +770,7 @@ class VulkanSetup
 
     private void cleanupSwapchain()
     {
-        foreach (fb; framebuffers)    vkDestroyFramebuffer(device, fb, null);
+        foreach (fb; framebuffers)   vkDestroyFramebuffer(device, fb, null);
         foreach (iv; swapImageViews) vkDestroyImageView  (device, iv, null);
         vkDestroySwapchainKHR(device, swapchain, null);
         framebuffers   = null;
@@ -497,9 +789,20 @@ class VulkanSetup
         }
         vkDestroyCommandPool(device, cmdPool, null);
         cleanupSwapchain();
-        vkDestroyRenderPass (device, renderPass, null);
-        vkDestroyDevice     (device, null);
-        vkDestroySurfaceKHR (instance, surface, null);
-        vkDestroyInstance   (instance, null);
+        vkDestroyRenderPass(device, renderPass, null);
+
+        vkDestroyPipeline      (device, rectPipeline,  null);
+        vkDestroyPipelineLayout(device, pipelineLayout, null);
+        vkDestroyDescriptorPool(device, descPool,       null);
+        vkDestroyDescriptorSetLayout(device, descSetLayout, null);
+        foreach (i; 0 .. MAX_FRAMES)
+        {
+            vkUnmapMemory   (device, ssboMemory[i]);
+            vkDestroyBuffer (device, ssboBuffer[i], null);
+            vkFreeMemory    (device, ssboMemory[i], null);
+        }
+        vkDestroyDevice    (device, null);
+        vkDestroySurfaceKHR(instance, surface, null);
+        vkDestroyInstance  (instance, null);
     }
 }
