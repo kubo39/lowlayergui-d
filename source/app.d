@@ -121,13 +121,31 @@ class App
     void run()
     {
         import core.sys.posix.poll : pollfd, poll, POLLIN;
+        import core.time : MonoTime, dur;
+        import std.stdio : writefln;
+
+        ulong frameCount;
+        auto fpsTimer = MonoTime.currTime;
 
         while (running)
         {
             display.flush();
 
             if (configured)
+            {
                 vulkan.renderFrame();
+                frameCount++;
+
+                auto now = MonoTime.currTime;
+                auto elapsed = now - fpsTimer;
+                if (elapsed >= dur!"seconds"(1))
+                {
+                    double fps = frameCount / (elapsed.total!"msecs" / 1000.0);
+                    writefln("FPS: %.1f", fps);
+                    frameCount = 0;
+                    fpsTimer = now;
+                }
+            }
 
             // Wayland ソケットをノンブロッキングで読み取り
             if (display.prepareRead() == 0)
