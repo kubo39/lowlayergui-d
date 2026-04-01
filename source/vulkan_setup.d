@@ -1,5 +1,7 @@
 module vulkan_setup;
 
+import font.atlas : GlyphAtlas;
+
 import erupted;
 import erupted.vulkan_lib_loader : loadGlobalLevelFunctions;
 import vk_platform :
@@ -14,6 +16,15 @@ import wayland.client : WlDisplay, WlSurface;
 import std.algorithm : min, max;
 import std.exception : enforce;
 import std.conv : to;
+
+// ---------------------------------------------------------------------------
+
+struct GlyphInstance {
+    float[4] posRect;  // x, y, w, h (NDC)
+    float[4] uvRect;   // u0, v0, u1, v1
+    float[4] color;    // RGBA
+}
+static assert(GlyphInstance.sizeof == 48);
 
 // ---------------------------------------------------------------------------
 
@@ -71,7 +82,7 @@ class VulkanSetup
     VkFence    [MAX_FRAMES] inFlight;
     uint currentFrame;
 
-    // Rect pipeline (Phase 4)
+    // Rect pipeline
     VkDescriptorSetLayout          descSetLayout;
     VkPipelineLayout               pipelineLayout;
     VkPipeline                     rectPipeline;
@@ -83,6 +94,26 @@ class VulkanSetup
 
     // Rect data — set from outside before renderFrame
     RectInstance[] rects;
+
+    enum MAX_GLYPHS = 4096;
+
+    VkDescriptorSetLayout          glyphDescSetLayout;
+    VkPipelineLayout               glyphPipelineLayout;
+    VkPipeline                     glyphPipeline;
+    VkBuffer      [MAX_FRAMES]     glyphSsboBuffer;
+    VkDeviceMemory[MAX_FRAMES]     glyphSsboMemory;
+    void*         [MAX_FRAMES]     glyphSsboBufMapped;
+    VkDescriptorPool               glyphDescPool;
+    VkDescriptorSet[MAX_FRAMES]    glyphDescSets;
+
+    // Atlas texture
+    VkImage        atlasImage;
+    VkImageView    atlasImageView;
+    VkDeviceMemory atlasMemory;
+    VkSampler      atlasSampler;
+
+    // Glyph data — set from outside before renderFrame
+    GlyphInstance[] glyphs;
 
     uint width, height;
     bool needsResize;
@@ -103,11 +134,14 @@ class VulkanSetup
         createCommandPool();
         allocCommandBuffers();
         createSyncObjects();
-        // Phase 4
         createDescSetLayout();
         createSsboBuffers();
         createDescriptors();
         createRectPipeline();
+        createGlyphDescSetLayout();
+        createGlyphSsboBuffers();
+        createGlyphDescriptors();
+        createGlyphPipeline();
     }
 
     // -------------------------------------------------------------------
@@ -421,7 +455,7 @@ class VulkanSetup
     }
 
     // -------------------------------------------------------------------
-    // Phase 4: rect instancing pipeline
+    // rect instancing pipeline
     // -------------------------------------------------------------------
 
     private uint findMemoryType(uint typeFilter, VkMemoryPropertyFlags props)
@@ -654,6 +688,403 @@ class VulkanSetup
     }
 
     // -------------------------------------------------------------------
+    // Glyph bitmap atlas pipeline
+    // -------------------------------------------------------------------
+
+    private void createGlyphDescSetLayout()
+    {
+        VkDescriptorSetLayoutBinding[2] bindings = [
+            {
+                binding:         0,
+                descriptorType:  VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                descriptorCount: 1,
+                stageFlags:      VK_SHADER_STAGE_VERTEX_BIT,
+            },
+            {
+                binding:         1,
+                descriptorType:  VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                descriptorCount: 1,
+                stageFlags:      VK_SHADER_STAGE_FRAGMENT_BIT,
+            },
+        ];
+        VkDescriptorSetLayoutCreateInfo info = {
+            sType:        VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+            bindingCount: 2,
+            pBindings:    bindings.ptr,
+        };
+        vkCreateDescriptorSetLayout(device, &info, null, &glyphDescSetLayout)
+            .enforceVK("vkCreateDescriptorSetLayout (glyph)");
+    }
+
+    private void createGlyphSsboBuffers()
+    {
+        VkDeviceSize bufSize = GlyphInstance.sizeof * MAX_GLYPHS;
+        foreach (i; 0 .. MAX_FRAMES)
+        {
+            VkBufferCreateInfo bInfo = {
+                sType:       VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                size:        bufSize,
+                usage:       VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                sharingMode: VK_SHARING_MODE_EXCLUSIVE,
+            };
+            vkCreateBuffer(device, &bInfo, null, &glyphSsboBuffer[i]).enforceVK;
+
+            VkMemoryRequirements memReqs;
+            vkGetBufferMemoryRequirements(device, glyphSsboBuffer[i], &memReqs);
+
+            VkMemoryAllocateInfo aInfo = {
+                sType:           VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                allocationSize:  memReqs.size,
+                memoryTypeIndex: findMemoryType(memReqs.memoryTypeBits,
+                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                    VK_MEMORY_PROPERTY_HOST_COHERENT_BIT),
+            };
+            vkAllocateMemory(device, &aInfo, null, &glyphSsboMemory[i]).enforceVK;
+            vkBindBufferMemory(device, glyphSsboBuffer[i], glyphSsboMemory[i], 0).enforceVK;
+            vkMapMemory(device, glyphSsboMemory[i], 0, bufSize, 0,
+                        &glyphSsboBufMapped[i]).enforceVK;
+        }
+    }
+
+    private void createGlyphDescriptors()
+    {
+        VkDescriptorPoolSize[2] poolSizes = [
+            { type: VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,         descriptorCount: MAX_FRAMES },
+            { type: VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, descriptorCount: MAX_FRAMES },
+        ];
+        VkDescriptorPoolCreateInfo poolInfo = {
+            sType:         VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+            maxSets:       MAX_FRAMES,
+            poolSizeCount: 2,
+            pPoolSizes:    poolSizes.ptr,
+        };
+        vkCreateDescriptorPool(device, &poolInfo, null, &glyphDescPool)
+            .enforceVK("vkCreateDescriptorPool (glyph)");
+
+        VkDescriptorSetLayout[MAX_FRAMES] layouts;
+        layouts[] = glyphDescSetLayout;
+        VkDescriptorSetAllocateInfo allocInfo = {
+            sType:              VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            descriptorPool:     glyphDescPool,
+            descriptorSetCount: MAX_FRAMES,
+            pSetLayouts:        layouts.ptr,
+        };
+        vkAllocateDescriptorSets(device, &allocInfo, glyphDescSets.ptr)
+            .enforceVK("vkAllocateDescriptorSets (glyph)");
+
+        VkDeviceSize bufSize = GlyphInstance.sizeof * MAX_GLYPHS;
+        foreach (i; 0 .. MAX_FRAMES)
+        {
+            VkDescriptorBufferInfo bufInfo = {
+                buffer: glyphSsboBuffer[i],
+                offset: 0,
+                range:  bufSize,
+            };
+            VkWriteDescriptorSet write = {
+                sType:           VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                dstSet:          glyphDescSets[i],
+                dstBinding:      0,
+                descriptorType:  VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                descriptorCount: 1,
+                pBufferInfo:     &bufInfo,
+            };
+            vkUpdateDescriptorSets(device, 1, &write, 0, null);
+        }
+    }
+
+    private void createGlyphPipeline()
+    {
+        auto vertCode = cast(immutable(ubyte)[]) import("glyph.vert.spv");
+        auto fragCode = cast(immutable(ubyte)[]) import("glyph.frag.spv");
+
+        auto vertMod = createShaderModule(vertCode);
+        auto fragMod = createShaderModule(fragCode);
+        scope(exit)
+        {
+            vkDestroyShaderModule(device, vertMod, null);
+            vkDestroyShaderModule(device, fragMod, null);
+        }
+
+        VkPipelineShaderStageCreateInfo[2] stages = [
+            {
+                sType:   VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                stage:   VK_SHADER_STAGE_VERTEX_BIT,
+                module_: vertMod,
+                pName:   "main".ptr,
+            },
+            {
+                sType:   VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                stage:   VK_SHADER_STAGE_FRAGMENT_BIT,
+                module_: fragMod,
+                pName:   "main".ptr,
+            },
+        ];
+
+        VkPipelineVertexInputStateCreateInfo vertInput = {
+            sType: VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+        };
+        VkPipelineInputAssemblyStateCreateInfo inputAssembly = {
+            sType:    VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+            topology: VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+        };
+
+        VkDynamicState[2] dynStates = [VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR];
+        VkPipelineDynamicStateCreateInfo dynState = {
+            sType:             VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+            dynamicStateCount: 2,
+            pDynamicStates:    dynStates.ptr,
+        };
+        VkPipelineViewportStateCreateInfo viewportState = {
+            sType:         VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+            viewportCount: 1,
+            scissorCount:  1,
+        };
+        VkPipelineRasterizationStateCreateInfo rasterizer = {
+            sType:       VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+            polygonMode: VK_POLYGON_MODE_FILL,
+            cullMode:    VK_CULL_MODE_NONE,
+            frontFace:   VK_FRONT_FACE_COUNTER_CLOCKWISE,
+            lineWidth:   1.0f,
+        };
+        VkPipelineMultisampleStateCreateInfo multisampling = {
+            sType:                VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+            rasterizationSamples: VK_SAMPLE_COUNT_1_BIT,
+        };
+
+        VkPipelineColorBlendAttachmentState blendAttach = {
+            colorWriteMask:      VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                                 VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT,
+            blendEnable:         VK_TRUE,
+            srcColorBlendFactor: VK_BLEND_FACTOR_SRC_ALPHA,
+            dstColorBlendFactor: VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+            colorBlendOp:        VK_BLEND_OP_ADD,
+            srcAlphaBlendFactor: VK_BLEND_FACTOR_ONE,
+            dstAlphaBlendFactor: VK_BLEND_FACTOR_ZERO,
+            alphaBlendOp:        VK_BLEND_OP_ADD,
+        };
+        VkPipelineColorBlendStateCreateInfo blending = {
+            sType:           VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+            attachmentCount: 1,
+            pAttachments:    &blendAttach,
+        };
+
+        VkPipelineLayoutCreateInfo layoutInfo = {
+            sType:          VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+            setLayoutCount: 1,
+            pSetLayouts:    &glyphDescSetLayout,
+        };
+        vkCreatePipelineLayout(device, &layoutInfo, null, &glyphPipelineLayout)
+            .enforceVK("vkCreatePipelineLayout (glyph)");
+
+        VkGraphicsPipelineCreateInfo pipelineInfo = {
+            sType:               VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+            stageCount:          2,
+            pStages:             stages.ptr,
+            pVertexInputState:   &vertInput,
+            pInputAssemblyState: &inputAssembly,
+            pViewportState:      &viewportState,
+            pRasterizationState: &rasterizer,
+            pMultisampleState:   &multisampling,
+            pColorBlendState:    &blending,
+            pDynamicState:       &dynState,
+            layout:              glyphPipelineLayout,
+            renderPass:          renderPass,
+            subpass:             0,
+        };
+        vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, null, &glyphPipeline)
+            .enforceVK("vkCreateGraphicsPipelines (glyph)");
+    }
+
+    /// グリフアトラス (R8) を GPU にアップロードし、descriptor set を更新する。
+    /// アトラスが変化するたびに呼び出す。
+    void uploadAtlas(ref GlyphAtlas atlas)
+    {
+        import core.stdc.string : memcpy;
+
+        uint w = GlyphAtlas.SIZE;
+        uint h = GlyphAtlas.SIZE;
+        VkDeviceSize imgSize = w * h; // R8: 1 byte per pixel
+
+        // 1. Staging buffer 作成
+        VkBuffer       stagingBuf;
+        VkDeviceMemory stagingMem;
+        {
+            VkBufferCreateInfo bInfo = {
+                sType:       VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                size:        imgSize,
+                usage:       VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                sharingMode: VK_SHARING_MODE_EXCLUSIVE,
+            };
+            vkCreateBuffer(device, &bInfo, null, &stagingBuf).enforceVK;
+
+            VkMemoryRequirements memReqs;
+            vkGetBufferMemoryRequirements(device, stagingBuf, &memReqs);
+            VkMemoryAllocateInfo aInfo = {
+                sType:           VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                allocationSize:  memReqs.size,
+                memoryTypeIndex: findMemoryType(memReqs.memoryTypeBits,
+                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                    VK_MEMORY_PROPERTY_HOST_COHERENT_BIT),
+            };
+            vkAllocateMemory(device, &aInfo, null, &stagingMem).enforceVK;
+            vkBindBufferMemory(device, stagingBuf, stagingMem, 0).enforceVK;
+
+            void* mapped;
+            vkMapMemory(device, stagingMem, 0, imgSize, 0, &mapped).enforceVK;
+            memcpy(mapped, atlas.pixels.ptr, imgSize);
+            vkUnmapMemory(device, stagingMem);
+        }
+        scope(exit)
+        {
+            vkDestroyBuffer(device, stagingBuf, null);
+            vkFreeMemory   (device, stagingMem, null);
+        }
+
+        // 2. アトラスイメージ作成 (初回のみ)
+        if (atlasImage == VK_NULL_HANDLE)
+        {
+            VkImageCreateInfo imgInfo = {
+                sType:         VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+                imageType:     VK_IMAGE_TYPE_2D,
+                format:        VK_FORMAT_R8_UNORM,
+                extent:        VkExtent3D(w, h, 1),
+                mipLevels:     1,
+                arrayLayers:   1,
+                samples:       VK_SAMPLE_COUNT_1_BIT,
+                tiling:        VK_IMAGE_TILING_OPTIMAL,
+                usage:         VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                sharingMode:   VK_SHARING_MODE_EXCLUSIVE,
+                initialLayout: VK_IMAGE_LAYOUT_UNDEFINED,
+            };
+            vkCreateImage(device, &imgInfo, null, &atlasImage).enforceVK("vkCreateImage (atlas)");
+
+            VkMemoryRequirements memReqs;
+            vkGetImageMemoryRequirements(device, atlasImage, &memReqs);
+            VkMemoryAllocateInfo aInfo = {
+                sType:           VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                allocationSize:  memReqs.size,
+                memoryTypeIndex: findMemoryType(memReqs.memoryTypeBits,
+                    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT),
+            };
+            vkAllocateMemory(device, &aInfo, null, &atlasMemory).enforceVK;
+            vkBindImageMemory(device, atlasImage, atlasMemory, 0).enforceVK;
+
+            VkImageViewCreateInfo viewInfo = {
+                sType:    VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+                image:    atlasImage,
+                viewType: VK_IMAGE_VIEW_TYPE_2D,
+                format:   VK_FORMAT_R8_UNORM,
+                subresourceRange: VkImageSubresourceRange(VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1),
+            };
+            vkCreateImageView(device, &viewInfo, null, &atlasImageView)
+                .enforceVK("vkCreateImageView (atlas)");
+
+            VkSamplerCreateInfo samplerInfo = {
+                sType:        VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+                magFilter:    VK_FILTER_LINEAR,
+                minFilter:    VK_FILTER_LINEAR,
+                mipmapMode:   VK_SAMPLER_MIPMAP_MODE_NEAREST,
+                addressModeU: VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                addressModeV: VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                addressModeW: VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                minLod:       0.0f,
+                maxLod:       0.0f,
+            };
+            vkCreateSampler(device, &samplerInfo, null, &atlasSampler)
+                .enforceVK("vkCreateSampler (atlas)");
+        }
+
+        // 3. 一時コマンドバッファで転送
+        VkCommandBufferAllocateInfo cbAllocInfo = {
+            sType:              VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+            commandPool:        cmdPool,
+            level:              VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+            commandBufferCount: 1,
+        };
+        VkCommandBuffer cmd;
+        vkAllocateCommandBuffers(device, &cbAllocInfo, &cmd).enforceVK;
+        scope(exit) vkFreeCommandBuffers(device, cmdPool, 1, &cmd);
+
+        VkCommandBufferBeginInfo beginInfo = {
+            sType: VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+            flags: VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+        };
+        vkBeginCommandBuffer(cmd, &beginInfo).enforceVK;
+
+        // UNDEFINED → TRANSFER_DST_OPTIMAL
+        VkImageMemoryBarrier barrier1 = {
+            sType:               VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            srcAccessMask:       0,
+            dstAccessMask:       VK_ACCESS_TRANSFER_WRITE_BIT,
+            oldLayout:           VK_IMAGE_LAYOUT_UNDEFINED,
+            newLayout:           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            srcQueueFamilyIndex: VK_QUEUE_FAMILY_IGNORED,
+            dstQueueFamilyIndex: VK_QUEUE_FAMILY_IGNORED,
+            image:               atlasImage,
+            subresourceRange:    VkImageSubresourceRange(VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1),
+        };
+        vkCmdPipelineBarrier(cmd,
+            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            0, 0, null, 0, null, 1, &barrier1);
+
+        VkBufferImageCopy region = {
+            imageSubresource: VkImageSubresourceLayers(VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1),
+            imageExtent:      VkExtent3D(w, h, 1),
+        };
+        vkCmdCopyBufferToImage(cmd, stagingBuf, atlasImage,
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+        // TRANSFER_DST_OPTIMAL → SHADER_READ_ONLY_OPTIMAL
+        VkImageMemoryBarrier barrier2 = {
+            sType:               VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            srcAccessMask:       VK_ACCESS_TRANSFER_WRITE_BIT,
+            dstAccessMask:       VK_ACCESS_SHADER_READ_BIT,
+            oldLayout:           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            newLayout:           VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            srcQueueFamilyIndex: VK_QUEUE_FAMILY_IGNORED,
+            dstQueueFamilyIndex: VK_QUEUE_FAMILY_IGNORED,
+            image:               atlasImage,
+            subresourceRange:    VkImageSubresourceRange(VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1),
+        };
+        vkCmdPipelineBarrier(cmd,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+            0, 0, null, 0, null, 1, &barrier2);
+
+        vkEndCommandBuffer(cmd).enforceVK;
+
+        VkSubmitInfo submitInfo = {
+            sType:              VK_STRUCTURE_TYPE_SUBMIT_INFO,
+            commandBufferCount: 1,
+            pCommandBuffers:    &cmd,
+        };
+        vkQueueSubmit(graphicsQueue, 1, &submitInfo, VK_NULL_HANDLE).enforceVK;
+        vkQueueWaitIdle(graphicsQueue).enforceVK;
+
+        // 4. descriptor set の binding 1 を更新 (image sampler)
+        VkDescriptorImageInfo imgDescInfo = {
+            sampler:     atlasSampler,
+            imageView:   atlasImageView,
+            imageLayout: VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        };
+        foreach (i; 0 .. MAX_FRAMES)
+        {
+            VkWriteDescriptorSet write = {
+                sType:           VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                dstSet:          glyphDescSets[i],
+                dstBinding:      1,
+                descriptorType:  VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                descriptorCount: 1,
+                pImageInfo:      &imgDescInfo,
+            };
+            vkUpdateDescriptorSets(device, 1, &write, 0, null);
+        }
+
+        atlas.dirty = false;
+    }
+
+    // -------------------------------------------------------------------
 
     void renderFrame()
     {
@@ -696,25 +1127,37 @@ class VulkanSetup
         };
         vkCmdBeginRenderPass(cmd, &rpInfo, VK_SUBPASS_CONTENTS_INLINE);
 
+        VkViewport vp = {
+            x: 0.0f, y: 0.0f,
+            width:    cast(float) swapExtent.width,
+            height:   cast(float) swapExtent.height,
+            minDepth: 0.0f,
+            maxDepth: 1.0f,
+        };
+        VkRect2D sc = { offset: VkOffset2D(0, 0), extent: swapExtent };
+        vkCmdSetViewport(cmd, 0, 1, &vp);
+        vkCmdSetScissor (cmd, 0, 1, &sc);
+
         if (rectCount > 0)
         {
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, rectPipeline);
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
                 pipelineLayout, 0, 1, &descSets[currentFrame], 0, null);
-
-            VkViewport vp = {
-                x: 0.0f, y: 0.0f,
-                width:    cast(float) swapExtent.width,
-                height:   cast(float) swapExtent.height,
-                minDepth: 0.0f,
-                maxDepth: 1.0f,
-            };
-            VkRect2D sc = { offset: VkOffset2D(0, 0), extent: swapExtent };
-            vkCmdSetViewport(cmd, 0, 1, &vp);
-            vkCmdSetScissor (cmd, 0, 1, &sc);
-
-            // 頂点バッファなし: gl_VertexIndex で6頂点クワッド生成
             vkCmdDraw(cmd, 6, cast(uint) rectCount, 0, 0);
+        }
+
+        // Glyph draw
+        size_t glyphCount = glyphs.length > MAX_GLYPHS ? MAX_GLYPHS : glyphs.length;
+        if (glyphCount > 0 && atlasImage != VK_NULL_HANDLE)
+        {
+            import core.stdc.string : memcpy;
+            memcpy(glyphSsboBufMapped[currentFrame], glyphs.ptr,
+                   GlyphInstance.sizeof * glyphCount);
+
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, glyphPipeline);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                glyphPipelineLayout, 0, 1, &glyphDescSets[currentFrame], 0, null);
+            vkCmdDraw(cmd, 6, cast(uint) glyphCount, 0, 0);
         }
 
         vkCmdEndRenderPass(cmd);
@@ -801,6 +1244,25 @@ class VulkanSetup
             vkDestroyBuffer (device, ssboBuffer[i], null);
             vkFreeMemory    (device, ssboMemory[i], null);
         }
+
+        if (atlasImage != VK_NULL_HANDLE)
+        {
+            vkDestroySampler  (device, atlasSampler,   null);
+            vkDestroyImageView(device, atlasImageView, null);
+            vkDestroyImage    (device, atlasImage,     null);
+            vkFreeMemory      (device, atlasMemory,    null);
+        }
+        vkDestroyPipeline      (device, glyphPipeline,       null);
+        vkDestroyPipelineLayout(device, glyphPipelineLayout,  null);
+        vkDestroyDescriptorPool(device, glyphDescPool,        null);
+        vkDestroyDescriptorSetLayout(device, glyphDescSetLayout, null);
+        foreach (i; 0 .. MAX_FRAMES)
+        {
+            vkUnmapMemory   (device, glyphSsboMemory[i]);
+            vkDestroyBuffer (device, glyphSsboBuffer[i], null);
+            vkFreeMemory    (device, glyphSsboMemory[i], null);
+        }
+
         vkDestroyDevice    (device, null);
         vkDestroySurfaceKHR(instance, surface, null);
         vkDestroyInstance  (instance, null);

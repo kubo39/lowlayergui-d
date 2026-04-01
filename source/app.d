@@ -1,7 +1,9 @@
 import wayland.client;
 import wayland.native.util : wl_array;
 import xdg_shell;
-import vulkan_setup : VulkanSetup, RectInstance;
+import vulkan_setup : VulkanSetup, RectInstance, GlyphInstance;
+import font.freetype : FontLibrary, FontFace, GlyphBitmap;
+import font.atlas    : GlyphAtlas, GlyphInfo;
 
 import std.algorithm : min;
 import std.exception : enforce;
@@ -22,6 +24,10 @@ class App
     XdgToplevel toplevel;
 
     VulkanSetup vulkan;
+
+    FontLibrary ftLib;
+    FontFace    ftFace;
+    GlyphAtlas  atlas;
 
     bool running    = true;
     bool configured = false; // 最初の xdg_surface configure 完了後に Vulkan 初期化
@@ -74,6 +80,7 @@ class App
                 // 初回 configure でサイズが確定してから Vulkan を初期化
                 vulkan = new VulkanSetup(display, surface, pendingW, pendingH);
                 setupDemoRects();
+                setupFont(pendingW, pendingH);
                 configured = true;
             }
             else if (vulkan)
@@ -116,6 +123,55 @@ class App
             }
         }
         vulkan.rects = rs;
+    }
+
+    private void setupFont(uint screenW, uint screenH)
+    {
+        import std.file : exists;
+        import std.stdio : writeln;
+
+        // 一般的なフォントパスを順に試す
+        static immutable string[] candidates = [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+            "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+            "/usr/share/fonts/TTF/DejaVuSans.ttf",
+        ];
+
+        string fontPath;
+        foreach (p; candidates)
+            if (p.exists) { fontPath = p; break; }
+
+        if (fontPath.length == 0)
+        {
+            stderr.writeln("Warning: no system font found, skipping text rendering");
+            return;
+        }
+        writeln("Font: ", fontPath);
+
+        ftLib  = new FontLibrary();
+        ftFace = ftLib.loadFace(fontPath);
+        ftFace.setPixelSize(0, 32); // 32px
+
+        atlas.initialize();
+
+        // デモ文字列のグリフをアトラスに登録
+        enum string demoText = "Hello, World!";
+        foreach (dchar ch; demoText)
+        {
+            if (ch in atlas.glyphs) continue;
+            auto bmp = ftFace.renderGlyph(ch);
+            atlas.addGlyph(ch, bmp);
+        }
+
+        vulkan.uploadAtlas(atlas);
+
+        vulkan.glyphs = buildGlyphInstances(
+            atlas, demoText,
+            50.0f, cast(float)(screenH) * 0.6f,  // 左寄り・画面中央やや下
+            [1.0f, 1.0f, 1.0f, 1.0f],            // 白
+            screenW, screenH
+        );
     }
 
     void run()
@@ -176,6 +232,52 @@ class App
         if (compositor) compositor.destroy();
         display.disconnect();
     }
+}
+
+/// テキストを画面座標 (ピクセル) で配置した GlyphInstance 配列を返す。
+/// startX, startY はベースラインの左端 (ピクセル座標、Y は画面上端が 0)。
+GlyphInstance[] buildGlyphInstances(
+    const ref GlyphAtlas atlas, string text,
+    float startX, float startY,
+    float[4] color,
+    uint screenW, uint screenH)
+{
+    GlyphInstance[] result;
+    float penX = startX;
+
+    foreach (dchar ch; text)
+    {
+        auto gp = ch in atlas.glyphs;
+        if (gp is null) { penX += 8; continue; } // 未登録: 幅 8px でスキップ
+
+        // 空グリフ (スペース等) はインスタンス追加しないが advance は進める
+        if (gp.width == 0 || gp.height == 0)
+        {
+            penX += gp.advanceX;
+            continue;
+        }
+
+        // ピクセル座標 → NDC 変換
+        // NDC: x=[-1,1] 左→右、y=[-1,1] 上→下 (Vulkan 規約)
+        float px = penX + gp.bearingX;
+        float py = startY - gp.bearingY;          // Y: 上端 (ピクセル)
+        float pw = cast(float) gp.width;
+        float ph = cast(float) gp.height;
+
+        float ndcX = 2.0f * px / screenW - 1.0f;
+        float ndcY = 2.0f * py / screenH - 1.0f;
+        float ndcW = 2.0f * pw / screenW;
+        float ndcH = 2.0f * ph / screenH;
+
+        GlyphInstance gi;
+        gi.posRect = [ndcX, ndcY, ndcW, ndcH];
+        gi.uvRect  = [gp.u0, gp.v0, gp.u1, gp.v1];
+        gi.color   = color;
+        result ~= gi;
+
+        penX += gp.advanceX;
+    }
+    return result;
 }
 
 void main()
