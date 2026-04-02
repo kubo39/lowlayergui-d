@@ -11,7 +11,7 @@ dependency "wayland:client" version="~>0.4"
 subConfiguration "wayland:client" "static"
 libs "wayland-client"
 
-libs "vulkan" "harfbuzz" "xkbcommon" "icuuc" "icui18n" "freetype"
+libs "vulkan" "harfbuzz" "xkbcommon" "freetype"
 
 lflags "-rpath=/usr/lib/x86_64-linux-gnu"
 

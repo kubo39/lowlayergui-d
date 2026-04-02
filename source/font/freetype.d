@@ -142,6 +142,8 @@ extern(C) @nogc nothrow
     FT_Error FT_Done_Face(FT_Face face);
     FT_Error FT_Set_Pixel_Sizes(FT_Face face, FT_UInt pixel_width, FT_UInt pixel_height);
     FT_Error FT_Load_Char(FT_Face face, FT_ULong char_code, FT_Int32 load_flags);
+    FT_Error FT_Load_Glyph(FT_Face face, FT_UInt glyph_index, FT_Int32 load_flags);
+    FT_UInt  FT_Get_Char_Index(FT_Face face, FT_ULong charcode);
 }
 
 // ────────────────────────────────────────────────────────────
@@ -199,6 +201,35 @@ class FontFace
         gb.bearingX = slot.bitmap_left;
         gb.bearingY = slot.bitmap_top;
         gb.advanceX = cast(int)(slot.advance.x >> 6); // 26.6 → 整数ピクセル
+
+        if (gb.width > 0 && gb.rows > 0)
+        {
+            import core.stdc.string : memcpy;
+            int absPitch = bmp.pitch < 0 ? -bmp.pitch : bmp.pitch;
+            gb.pixels.length = gb.width * gb.rows;
+            foreach (row; 0 .. gb.rows)
+                memcpy(gb.pixels.ptr + row * gb.width,
+                       bmp.buffer   + row * absPitch,
+                       gb.width);
+        }
+        return gb;
+    }
+
+    /// グリフ ID でラスタライズして GlyphBitmap を返す。
+    GlyphBitmap renderGlyphById(uint glyphId)
+    {
+        auto err = FT_Load_Glyph(_face, glyphId, FT_LOAD_RENDER);
+        if (err != 0) return GlyphBitmap.init;
+
+        FT_GlyphSlot slot = _face.glyph;
+        FT_Bitmap*   bmp  = &slot.bitmap;
+
+        GlyphBitmap gb;
+        gb.width    = bmp.width;
+        gb.rows     = bmp.rows;
+        gb.bearingX = slot.bitmap_left;
+        gb.bearingY = slot.bitmap_top;
+        gb.advanceX = cast(int)(slot.advance.x >> 6);
 
         if (gb.width > 0 && gb.rows > 0)
         {

@@ -1,9 +1,10 @@
 import wayland.client;
 import wayland.native.util : wl_array;
 import xdg_shell;
-import vulkan_setup : VulkanSetup, RectInstance, GlyphInstance;
+import vulkan_setup  : VulkanSetup, RectInstance, GlyphInstance;
 import font.freetype : FontLibrary, FontFace, GlyphBitmap;
 import font.atlas    : GlyphAtlas, GlyphInfo;
+import text.shaper   : TextShaper, ShapedGlyph;
 
 import std.algorithm : min;
 import std.exception : enforce;
@@ -28,6 +29,7 @@ class App
     FontLibrary ftLib;
     FontFace    ftFace;
     GlyphAtlas  atlas;
+    TextShaper  shaper;
 
     bool running    = true;
     bool configured = false; // 最初の xdg_surface configure 完了後に Vulkan 初期化
@@ -130,8 +132,11 @@ class App
         import std.file : exists;
         import std.stdio : writeln;
 
-        // 一般的なフォントパスを順に試す
+        // 一般的なフォントパスを順に試す (日本語対応フォントを優先)
         static immutable string[] candidates = [
+            "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
             "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
             "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
             "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
@@ -153,21 +158,26 @@ class App
         ftFace = ftLib.loadFace(fontPath);
         ftFace.setPixelSize(0, 32); // 32px
 
+        shaper = new TextShaper(ftFace);
         atlas.initialize();
 
-        // デモ文字列のグリフをアトラスに登録
-        enum string demoText = "Hello, World!";
-        foreach (dchar ch; demoText)
+        // デモ文字列をシェーピングしてグリフ ID を取得
+        // 日本語を含めることでシェーピング (グリフID変換) が正しく動くか確認できる
+        enum string demoText = "こんにちは World";
+        auto shaped = shaper.shape(demoText);
+
+        // シェーピング結果のグリフ ID をアトラスに登録
+        foreach (ref sg; shaped)
         {
-            if (ch in atlas.glyphs) continue;
-            auto bmp = ftFace.renderGlyph(ch);
-            atlas.addGlyph(ch, bmp);
+            if (sg.glyphId in atlas.glyphs) continue;
+            auto bmp = ftFace.renderGlyphById(sg.glyphId);
+            atlas.addGlyph(sg.glyphId, bmp);
         }
 
         vulkan.uploadAtlas(atlas);
 
         vulkan.glyphs = buildGlyphInstances(
-            atlas, demoText,
+            atlas, shaped,
             50.0f, cast(float)(screenH) * 0.6f,  // 左寄り・画面中央やや下
             [1.0f, 1.0f, 1.0f, 1.0f],            // 白
             screenW, screenH
@@ -234,10 +244,10 @@ class App
     }
 }
 
-/// テキストを画面座標 (ピクセル) で配置した GlyphInstance 配列を返す。
+/// シェーピング済みグリフ列を画面座標 (ピクセル) で配置した GlyphInstance 配列を返す。
 /// startX, startY はベースラインの左端 (ピクセル座標、Y は画面上端が 0)。
 GlyphInstance[] buildGlyphInstances(
-    const ref GlyphAtlas atlas, string text,
+    const ref GlyphAtlas atlas, const ShapedGlyph[] shaped,
     float startX, float startY,
     float[4] color,
     uint screenW, uint screenH)
@@ -245,22 +255,22 @@ GlyphInstance[] buildGlyphInstances(
     GlyphInstance[] result;
     float penX = startX;
 
-    foreach (dchar ch; text)
+    foreach (ref sg; shaped)
     {
-        auto gp = ch in atlas.glyphs;
+        auto gp = sg.glyphId in atlas.glyphs;
         if (gp is null) { penX += 8; continue; } // 未登録: 幅 8px でスキップ
 
         // 空グリフ (スペース等) はインスタンス追加しないが advance は進める
         if (gp.width == 0 || gp.height == 0)
         {
-            penX += gp.advanceX;
+            penX += sg.xAdvance;
             continue;
         }
 
         // ピクセル座標 → NDC 変換
         // NDC: x=[-1,1] 左→右、y=[-1,1] 上→下 (Vulkan 規約)
-        float px = penX + gp.bearingX;
-        float py = startY - gp.bearingY;          // Y: 上端 (ピクセル)
+        float px = penX + gp.bearingX + sg.xOffset;
+        float py = startY - gp.bearingY - sg.yOffset;  // Y: 上端 (ピクセル)
         float pw = cast(float) gp.width;
         float ph = cast(float) gp.height;
 
@@ -275,7 +285,7 @@ GlyphInstance[] buildGlyphInstances(
         gi.color   = color;
         result ~= gi;
 
-        penX += gp.advanceX;
+        penX += sg.xAdvance;
     }
     return result;
 }

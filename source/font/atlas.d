@@ -25,7 +25,7 @@ struct GlyphAtlas
     uint             cursorX = PADDING;
     uint             cursorY = PADDING;
     uint             rowH    = 0;
-    GlyphInfo[dchar] glyphs;
+    GlyphInfo[uint] glyphs;  // キー: FreeType グリフ ID
     bool             dirty = false;
 
     void initialize()
@@ -37,9 +37,12 @@ struct GlyphAtlas
     /// グリフをアトラスに追加する。
     /// すでに登録済みの場合はそのポインタを返す。
     /// アトラスが溢れた場合は null を返す。
-    GlyphInfo* addGlyph(dchar ch, ref const GlyphBitmap bmp)
+    /// グリフ ID をキーにアトラスへ登録する。
+    /// すでに登録済みの場合はそのポインタを返す。
+    /// アトラスが溢れた場合は null を返す。
+    GlyphInfo* addGlyph(uint glyphId, ref const GlyphBitmap bmp)
     {
-        if (auto p = ch in glyphs) return p;
+        if (auto p = glyphId in glyphs) return p;
 
         GlyphInfo gi;
         gi.bearingX = bmp.bearingX;
@@ -52,8 +55,8 @@ struct GlyphAtlas
         if (bmp.width == 0 || bmp.rows == 0)
         {
             gi.u0 = gi.v0 = gi.u1 = gi.v1 = 0;
-            glyphs[ch] = gi;
-            return ch in glyphs;
+            glyphs[glyphId] = gi;
+            return glyphId in glyphs;
         }
 
         uint w = bmp.width + PADDING;
@@ -86,7 +89,7 @@ struct GlyphAtlas
         rowH     = max(rowH, h);
         dirty    = true;
 
-        glyphs[ch] = gi;
-        return ch in glyphs;
+        glyphs[glyphId] = gi;
+        return glyphId in glyphs;
     }
 }

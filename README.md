@@ -17,8 +17,8 @@ apt install \
   vulkan-validationlayers \
   libharfbuzz-dev \
   libxkbcommon-dev \
-  libicu-dev \
   libfreetype-dev \
+  fonts-noto-cjk \
   glslang-tools
 ```
 
@@ -30,8 +30,8 @@ apt install \
 | `vulkan-validationlayers` | 開発時デバッグ |
 | `libharfbuzz-dev` | テキストシェーピング |
 | `libxkbcommon-dev` | キーボードレイアウト変換 |
-| `libicu-dev` | BiDi・Unicode 処理 |
 | `libfreetype-dev` | TTF フォント読み込み・アウトライン取得 |
+| `fonts-noto-cjk` | CJK フォント (日本語テキスト表示に必要) |
 | `glslang-tools` | GLSL シェーダの SPIR-V コンパイル |
 
 ### 動作環境
